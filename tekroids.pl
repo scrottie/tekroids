@@ -2,16 +2,23 @@
 
 =for comment
 
-o. decide on a size of the universe that's larger than the size of the screen
-o. make asteroids go forever and wrap around the edges of the world
-o. stick ships in random locations on the map and render each person's perspective
-o. let people thrust around!
-o. shoot stuff
+Multiplayer telnet-based Asteroids clone for Tektronix 4014 terminal emulation.
+
+This runs as a daemon that people can telnet in to.  It requires an xterm with Tektronix emulation.
+
+Connected players can find each other on the map and co-operate.
+
+Control the ship with the mouse.  It auto-fires constantly (as there's no good way I've found to read
+button presses while keeping things real-time).  The further the cursor is from your ship, the faster
+you accelerate in that direction.
+
+TODO
+
+o. wrap around the edges of the world isn't graceful; you can't see past the edges, so asteroids etc suddenly appear
 o. maybe peoples ships should have varied shapes
 o. 760 or 768?  get it right
-o. asteroid gravitational attraction and merging?
-o. right now, the ship can steer instantly; that's wrong; new moment needs to get added to existing
-o. parallex stars?  starfield generator?
+o. asteroid gravitational attraction and merging?  tried merging; very interesting indeed
+o. parallex stars?  starfield generator?  some kind of point of reference would make stuff less confusing
 
 =cut
 
@@ -20,8 +27,6 @@ use warnings;
 
 use Coro;
 use Coro::Socket;
-# use Coro::Event;
-# use Coro::AnyEvent;
 use Coro::Event;
 use Coro::Timer 'sleep';
 
@@ -29,7 +34,6 @@ use IO::Handle;
 use IO::Socket;
 
 # use POSIX qw(:errno_h);
-# use Time::HiRes; # 'select';
 use Time::HiRes 'usleep';
 use Math::Trig 'deg2rad';
 use Fcntl;
@@ -37,12 +41,12 @@ use Fcntl;
 sub opt ($) { scalar grep $_ eq $_[0], @ARGV }
 sub arg ($) { my $opt = shift; my $i=1; while($i<=$#ARGV) { return $ARGV[$i] if $ARGV[$i-1] eq $opt; $i++; } }
 
-my $world_x = 8192;
-my $world_y = 8192;
-#my $world_x = 4096;
-#my $world_y = 4096;
+# my $world_x = 8192;
+# my $world_y = 8192;
+my $world_x = 4096;
+my $world_y = 4096;
 
-my @asteroids = map { asteroid->new } 1..200;
+my @asteroids = map { asteroid->new } 1..100;
 my @missiles;
 my @ships;
 
@@ -53,7 +57,7 @@ my $telnetlisten = eval {
     warn "listening on port $port";
     Coro::Socket->new(
         LocalPort => $port,
-        Type      => SOCK_STREAM,
+        # Type      => SOCK_STREAM,
         Listen    => SOMAXCONN,
     ); 
 } or do { $port++; goto listen_again; };
@@ -61,6 +65,8 @@ my $telnetlisten = eval {
 async {
 
     # animate calls, collision detection
+
+    my $timestamp = Time::HiRes::gettimeofday; 
 
     while(1) {
 
@@ -104,7 +110,12 @@ async {
         #
         #
     
-        Coro::Timer::sleep 1/60;
+        # Coro::Timer::sleep 1/60;
+        my $new_ts = Time::HiRes::gettimeofday;
+        my $sleep_for = 1/30 - ( $new_ts - $timestamp );
+        $sleep_for = 0 if $sleep_for < 0;
+        $timestamp = $new_ts;
+        Coro::Timer::sleep $sleep_for;
 
     }
 
@@ -130,6 +141,7 @@ while(1) {
         my $line = '';      # character input buffer
         my $message = '';   # score / messages / diagnostic output to the player
         my $frame;
+        my $timestamp = Time::HiRes::gettimeofday;
 
         my $ship = ship->new;
         push @ships, $ship;
@@ -227,9 +239,13 @@ while(1) {
                 $thrust = 0.1 if $distance > 100;  # XXX tune this
                 $thrust = 0.2 if $distance > 200;  # XXX tune this
                 $thrust = 0.3 if $distance > 400;  # XXX tune this
+
+                $thrust /= 2 if $thrust > 0 and abs($ship->x_velocity) > 1.5 or abs($ship->y_velocity) > 1.5;  # XXX tune this
+                $thrust /= 2 if $thrust > 0 and abs($ship->x_velocity) > 3 or abs($ship->y_velocity) > 3;
+                $thrust = 0 if $thrust > 0 and abs($ship->x_velocity) > 7 or abs($ship->y_velocity) > 7;
     
                 $ship->add_thrust( $thrust );
-    
+ 
                 $message = $ship->x . ' ' . $ship->y . ' ' . $ship->x_velocity . ' ' . $ship->y_velocity;
     
             }
@@ -257,7 +273,11 @@ while(1) {
             #
     
             # usleep 16666*2;  # 16666 = 1/60th of a second # XXX use AnyEvent::Timer instead
-            Coro::Timer::sleep 1/60;
+            my $new_ts = Time::HiRes::gettimeofday;
+            my $sleep_for = 1/30 - ( $new_ts - $timestamp );
+            $timestamp = $new_ts;
+            $sleep_for = 0 if $sleep_for < 0;
+            Coro::Timer::sleep $sleep_for;
     
         }
     
@@ -582,8 +602,10 @@ sub new {
 sub animate {
     my $self = shift;
     $self->SUPER::animate;
-    $self->x_velocity *= 0.95; # XXX tune this
-    $self->y_velocity *= 0.95;
+    #if( $self->x_velocity > 3 or $self->y_velocity > 3 ) {
+    #    $self->x_velocity *= 0.95;
+    #    $self->y_velocity *= 0.95;
+    #}
 }
 
 sub hit { }
