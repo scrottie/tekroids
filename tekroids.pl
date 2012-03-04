@@ -12,6 +12,12 @@ Control the ship with the mouse.  It auto-fires constantly (as there's no good w
 button presses while keeping things real-time).  The further the cursor is from your ship, the faster
 you accelerate in that direction.
 
+When you die, your ship vanishes and all of the asteroids except the one that killed you vanish.  If you
+sit there long enough, eventually it should come around again.  To re-join the game, disconnect 
+(probably control-"]" then "c", then enter) and then re-connect.  Until the server gets restarted, the
+same set of asteroids will be floating around.  More aren't added once the game starts.  It's possible
+to clear the universe of asteroids.
+
 TODO
 
 o. wrap around the edges of the world isn't graceful; you can't see past the edges, so asteroids etc suddenly appear
