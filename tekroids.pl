@@ -21,7 +21,7 @@ to clear the universe of asteroids.
 Some info on the Tekronics 4014 terminal and its emulation:  
 * http://invisible-island.net/xterm/xterm.faq.html
 * http://www.chilton-computing.org.uk/acd/icf/terminals/p005.htm 
-o. http://slowass.net/~scott/tmp/tek-4014-um.pdf
+* http://slowass.net/~scott/tmp/tek-4014-um.pdf
 
 TODO
 
@@ -33,10 +33,34 @@ o. asteroid gravitational attraction and merging?  tried merging; very interesti
 o. parallex stars?  starfield generator?  some kind of point of reference would make stuff less confusing
 o. http://www.youtube.com/watch?v=psaM7kK5Toc ... tune this thing up better so it looks like that
 
+PERFORMANCE
+
+I really expected that this would handle thousands of asteroids gracefully, but it bogs with just a few hundred.
+Not the client -- the server.  This.
+
+Last time this was timed:
+
+collision => 430364019768
+draw      => 196395798904
+animate   => 430356592784
+
+I figured collision detection would be taking the vast majority of the CPU, but it doesn't take any more than
+just advacing objects on their trajectories, which is fair micro-optimized.
+
+NYTProf coredumps, probably because of Coro.
+
+Objects are kept sorted by X.  quicksort runs very near O(n) time when the data is almost entirely already sorted,
+so keeping it sorted as items are added is pretty inexpensive.
+
+Most of the inlining things and breaking encapsulation and other muckiness seems to be for naught and should 
+probably be ripped back out.
+
 =cut
 
 use strict;
 use warnings;
+
+use sort '_quicksort';
 
 use Coro;
 use Coro::Socket;
@@ -47,7 +71,7 @@ use IO::Handle;
 use IO::Socket;
 
 # use POSIX qw(:errno_h);
-use Time::HiRes 'usleep';
+# use Time::HiRes 'gettimeofday';
 use Math::Trig 'deg2rad';
 use Fcntl;
 
@@ -56,16 +80,17 @@ sub arg ($) { my $opt = shift; my $i=1; while($i<=$#ARGV) { return $ARGV[$i] if 
 
 # my $world_x = 8192;
 # my $world_y = 8192;
-my $world_x = 4096;
-my $world_y = 4096;
+my $world_x = 2500;
+my $world_y = 2500;
 
-my @asteroids = map { asteroid->new } 1..40;
-my @missiles;
-my @ships;
+my @objects = map { asteroid->new } 1..15;
 
 my $num_players = 0;
 
 my $port = 2003;
+
+#use Benchmark;
+#my %timers;
 
 listen_again:
 my $telnetlisten = eval { 
@@ -89,54 +114,55 @@ async {
         # collision detection
         #
 
-        if( @ships ) {
+#        if( ! grep ref $_ eq 'ship', @objects ) { # XXXX
 
             # no one looking?  nothing happens
 
-            my @all = ( @ships, @missiles, @asteroids );
-    
             # for now, only interested in ship<->asteroid collisions and bullet<->asteroid collisions
     
-            test_collided( @all );
+            test_collided( );
+            # $timers{collision} += timeit(1, sub { test_collided( ) } ); # XXX
     
-            # for my $o ( @ships ) { undef $o if $o->destroyed }      @ships = grep defined, @ships;
-            for my $o ( @asteroids ) { undef $o if $o->destroyed }  @asteroids = grep defined, @asteroids;
-
-        };
+#        };
 
         #
         # move things
         #
 
-        @asteroids = grep defined, @asteroids;
+        for my $ob ( @objects ) {
+            $ob->animate;
+        }
 
-        for my $asteroid ( @asteroids ) {
-            $asteroid->animate;
-        }
+        #$timers{animate} += timeit(1, sub {
+        #    for my $ob ( @objects ) {
+        #        $ob->animate;
+        #    }
+        #}); # XXX
+
+        #
+        # reap things lost in collisions or animated until they're expired
+        #
  
-        @ships = grep defined, @ships;
- 
-        for my $s (@ships) {
-            $s->animate;
-        }
- 
-        for my $missile (@missiles) {
-            next unless $missile;
-            $missile->animate or do { $missile = undef; next; }; # expired
-        }
- 
-        @missiles = grep defined, @missiles;
+        @objects = grep { ! $_->destroyed } @objects;
 
         #
         #
         #
     
-        # Coro::Timer::sleep 1/60;
         my $new_ts = Time::HiRes::gettimeofday;
-        my $sleep_for = 1/30 - ( $new_ts - $timestamp );
+        my $sleep_for = 1/15 - ( $new_ts - $timestamp );
         $sleep_for = 0 if $sleep_for < 0;
         $timestamp = $new_ts;
         Coro::Timer::sleep $sleep_for;
+
+        #
+        #
+        #
+
+        #for my $k (keys %timers) {
+        #    print "$k => $timers{$k}  ";
+        #}
+        #print "\n";
 
     }
 
@@ -156,16 +182,19 @@ while(1) {
             chr(27), "[?38h",   # TEK mode from vtwhatever mode
             chr(27), chr(12),   # clear screen 
             chr(13+16),                           # graphics mode
-            # "\n",
         ); 
 
         my $line = '';      # character input buffer
         my $message = '';   # score / messages / diagnostic output to the player
         my $frame;
         my $timestamp = Time::HiRes::gettimeofday;
+ 
+        my $fps_count = 0;
+        my $fps_count_last = 0;
+        my $fps_second = time;
 
         my $ship = ship->new;
-        push @ships, $ship;
+        push @objects, $ship;
 
         $num_players++;
         print "got client connection: " . scalar(localtime) . " num players: $num_players\n";
@@ -173,53 +202,42 @@ while(1) {
       client_connected:
         while(1) {
     
-            $client->print(
-                chr(27), chr(12),   # clear screen 
-    
-                chr(13+16),                   # graphics mode   # needed to clear screen
-                # draw_point(0, 738),         # position cursor                # also needed to clear screen for some reason
-                draw_point(0, 6),             # position cursor                # also needed to clear screen for some reason
-                chr(15+16),                   # text mode
-                $message, "\n",
-    
-                chr(13+16),         # graphics mode
-            );
-    
             #
-            # asteroids
+            # draw
             #
     
-            if( $ship->destroyed ) {
-                # only show the astroid that got us
-                for my $asteroid ( @asteroids ) {
-                    next unless defined $asteroid;
-                    $client->print( $asteroid->draw( $ship ) ) if $ship->destroyed == $asteroid;
+            if( my  $destroyed = $ship->destroyed ) {
+
+                # draw missiles and other ships, but not our own ship, and only the asteroid that killed us
+
+                $client->print( fun_stuff($message) );
+                for my $ob ( @objects ) {
+                    $client->print( $ob->draw( $ship ) ) if $destroyed == $ob or ref $ob eq 'missile' or (ref $ob eq 'ship' and $ob ne $ship);
                 }
+
             } else {
-                for my $asteroid ( @asteroids ) {
-                    next unless defined $asteroid;
-                    $client->print( $asteroid->draw( $ship ) );
+
+                my $buf = '';
+                my $i = 0;
+                $i++ while $i < $#objects and $objects[$i]->[2] + 570 < $ship->[2];
+                while( $i < $#objects and $objects[$i]->[2] < $ship->[2] + 570 ) {
+                    $buf .= $objects[$i]->draw( $ship ) if $objects[$i]->[3] + 500 > $ship->[3] and $objects[$i]->[3] < $ship->[3] + 500;
+                    $i++;
                 }
+                $client->print(fun_stuff($message), $buf);  # wait on printing the clear screen until we have data to send to minimize flicker
+
+                # for my $ob ( @objects ) {
+                #     $client->print( $ob->draw( $ship ) );
+                # }
+
+                #$timers{draw} += timeit(1, sub {
+                #    for my $ob ( @objects ) {
+                #        $client->print( $ob->draw( $ship ) );
+                #    }
+                #});
+
             }
-    
-            #
-            # ships
-            #
-    
-            for my $s (@ships) {
-                next unless defined $s;
-                $client->print( $s->draw( $ship ) ) if ! $s->destroyed;
-            }
-    
-            #
-            # missiles 
-            #
-    
-            for my $missile (@missiles) {
-                next unless $missile;
-                $client->print( $missile->draw( $ship ) );
-            }
-    
+
             #
             # input
             #
@@ -231,7 +249,7 @@ while(1) {
     
             my $line = '';
             while( length($line) < 4 ) {
-                my $c = $client->getc();
+                $client->read(my $c, 1);
                 defined $c or do { print "null read: character not defined; exiting for this client\n"; last client_connected; }
 ;
                 length $c or do { print "zero length but not null read... meh? lasting I guess\n"; last client_connected; };
@@ -270,8 +288,16 @@ while(1) {
     
                 $ship->add_thrust( $thrust );
  
-                $message = 'x: ' . int($ship->x) . ' y: ' . int($ship->y) . ' asteroids: ' . scalar(@asteroids) . ' missiles: ' . scalar(@missiles) . ' ships: ' . scalar(@ships) . " players: $num_players ";
-                # $ship->x_velocity . ' ' . $ship->y_velocity;
+                my %nums = ( asteroid => 0, missile => 0, ship => 0 );
+                for my $ob (@objects) { $nums{ref $ob}++ }
+                if( $fps_second == time ) {
+                    $fps_count++;
+                } else {
+                    $fps_count_last = $fps_count;
+                    $fps_count = 0;    
+                    $fps_second = time;
+                }
+                $message = 'x: ' . int($ship->x) . ' y: ' . int($ship->y) . " asteroids: $nums{asteroid} missiles: $nums{missile} ships: $nums{ship} players: $num_players fps: $fps_count_last";
     
             }
     
@@ -282,16 +308,14 @@ while(1) {
             $frame++;
     
             if( ! $ship->destroyed ) {
-                if( ! ( $frame % 3 ) ) {   # XXX tune this
+                if( ! ( $frame % 5 ) ) {   # XXX tune this
                     my $missile = missile->new;
                     $ship->copy_position_and_velocity_to( $missile );
                     $missile->animate for 1..2; # start in front of the ship
                     $missile->add_thrust( 3 );
-                    push @missiles, $missile;  
+                    push @objects, $missile;  
                 }
             }
-    
-            # $message = 'ship x: ' . int($ship->x) . ' y: ' . int($ship->y) . ' missiles: ' . scalar(@missiles); $message .= ' x: ' . int($missiles[-1]->x) . ' y: ' . int($missiles[-1]->y) if @missiles; # XXX
     
             #
             #
@@ -299,14 +323,14 @@ while(1) {
     
             # usleep 16666*2;  # 16666 = 1/60th of a second # XXX use AnyEvent::Timer instead
             my $new_ts = Time::HiRes::gettimeofday;
-            my $sleep_for = 1/30 - ( $new_ts - $timestamp );
+            my $sleep_for = 1/15 - ( $new_ts - $timestamp );
             $timestamp = $new_ts;
             $sleep_for = 0 if $sleep_for < 0;
             Coro::Timer::sleep $sleep_for;
     
         }
 
-        @ships = grep $_ ne $ship, @ships;
+        @objects = grep $_ ne $ship, @objects;
 
         $num_players--;
     
@@ -318,7 +342,7 @@ while(1) {
 
 sub test_collided {
 
-    my @all = sort { $a->x <=> $b->x } @_;
+    @objects = sort { $a->x <=> $b->x } @objects;
 
     my $left_i = 0;
     my $right_i = 0;
@@ -334,10 +358,10 @@ sub test_collided {
 
         next if $left_i == $right_i;
 
-        last if $right_i > $#all;
+        last if $right_i > $#objects;
 
-        my $left = $all[ $left_i ];
-        my $right = $all[ $right_i ];
+        my $left = $objects[ $left_i ];
+        my $right = $objects[ $right_i ];
 
         # print "test_collided: left_i: $left_i right_i: $right_i left x: @{[ $left->x ]} right x: @{[ $right->x ]}\n";
 
@@ -374,7 +398,6 @@ sub test_collided {
         # die "combined size: $size hypot: " . sqrt( abs( $x_a - $x_b ) ** 2 + abs( $y_a - $y_b ) ** 2 ) . '; a ' . ref( $left ) . ' hit a ' . ref( $right ); 
 
         # awww, shit
-        # $collided++; # XXX slow
         $left->hit( $right );
         $right->hit( $left );
 
@@ -406,6 +429,21 @@ sub text_mode {
     return join( '',
         draw_point(0, 0),                             # needed to clear screen
         chr(15+16),                   # text mode
+    );
+}
+
+sub fun_stuff {
+    my $message = shift;
+    return join( '',
+        chr(27), chr(12),   # clear screen 
+    
+        chr(13+16),                   # graphics mode   # needed to clear screen
+        # draw_point(0, 738),         # position cursor                # also needed to clear screen for some reason
+        draw_point(0, 6),             # position cursor                # also needed to clear screen for some reason
+        chr(15+16),                   # text mode
+        $message, "\n",
+
+        chr(13+16),         # graphics mode
     );
 }
 
@@ -443,7 +481,7 @@ sub draw {
     my $x = $self->x;
     my $y = $self->y;
 
-    return '' if abs($x - $viewer->x) < -100 or abs($x - $viewer->x) > 1124 or abs($y - $viewer->y) < -100 or abs($y - $viewer->y) > 1124;
+    # return '' if abs($x - $viewer->x) < -50 or abs($x - $viewer->x) > 1070 or abs($y - $viewer->y) < -50 or abs($y - $viewer->y) > 1070;
 
     my @shape = @$shape;  # copy
     my $arc = $self->rot;
@@ -512,7 +550,7 @@ sub new {
     $self->y = int rand $world_y;
     $self->x_velocity = (int rand 2) ? 1 + int rand 3 : - ( 1 + int rand 3);
     $self->y_velocity = (int rand 2) ? 1 + int rand 3 : - ( 1 + int rand 3);
-    $self->invincible = 20; # from each other, if enabled
+    # $self->invincible = 20; # from each other, if enabled
     # my $i = int rand 40; # see note below about adding up all of the arcs to compute the final point
     my $i = 0;  # some random rotation should mask this lack of randomness
     my $flip_flop = 0;
@@ -539,7 +577,9 @@ sub new {
 
 sub animate {
     my $self = shift;
-    $self->SUPER::animate;
+    # $self->SUPER::animate; # inline stuff instead
+    $self->[2] += $self->[4];  $self->[2] = $world_x if $self->[2] < 0; $self->[2] = 0 if $self->[2] > $world_x;
+    $self->[3] += $self->[5];  $self->[3] = $world_y if $self->[3] < 0; $self->[3] = 0 if $self->[3] > $world_y;
     # $self->invincible-- if $self->invincible > 0;
     $self->rot += $self->rot_velocity;
     $self->rot -= 360 if $self->rot >= 360;
@@ -569,16 +609,18 @@ sub break_up {
     $self->destroyed = 1;
 
     my $size = $self->size;
-    return if $size / 2 < 5;
+    return if $size / 2 < 6;
 
-    for (1..3) {
+    my $num_new_asteroids = $size > 20 ? 3 : 2;
+
+    for (1..$num_new_asteroids) {
 
         # my $asteroid = asteroid->new( $size * 2 / 3 ); # looks better but explodes exponentially into black ink when asteroids are allowed to hit each other
         my $asteroid = asteroid->new( $size / 2 );
 
         $self->copy_position_and_velocity_to( $asteroid );
 
-        $asteroid->invincible = 20;
+        # $asteroid->invincible = 20;
 
         my $angle = int rand 360;
 
@@ -590,7 +632,7 @@ sub break_up {
 
         # $asteroid->animate for 1..2; # try to get out of collision range before we make a huge mess XXX
 
-        push @asteroids, $asteroid;
+        push @objects, $asteroid;
     }
 
 }
@@ -632,7 +674,9 @@ sub new {
 
 sub animate {
     my $self = shift;
-    $self->SUPER::animate;
+    # $self->SUPER::animate; # inline stuff instead
+    $self->[2] += $self->[4];  $self->[2] = $world_x if $self->[2] < 0; $self->[2] = 0 if $self->[2] > $world_x;
+    $self->[3] += $self->[5];  $self->[3] = $world_y if $self->[3] < 0; $self->[3] = 0 if $self->[3] > $world_y;
     #if( $self->x_velocity > 3 or $self->y_velocity > 3 ) {
     #    $self->x_velocity *= 0.95;
     #    $self->y_velocity *= 0.95;
@@ -659,8 +703,10 @@ sub new {
 
 sub animate {
     my $self = shift;
-    $self->SUPER::animate;
-    return 1 if $self->decay-- > 0;
+    # $self->SUPER::animate; # inline stuff instead
+    $self->[2] += $self->[4];  $self->[2] = $world_x if $self->[2] < 0; $self->[2] = 0 if $self->[2] > $world_x;
+    $self->[3] += $self->[5];  $self->[3] = $world_y if $self->[3] < 0; $self->[3] = 0 if $self->[3] > $world_y;
+    $self->destroyed = 1 if $self->decay-- <= 0;
 }
 
 sub draw {
@@ -671,7 +717,7 @@ sub draw {
     my $y = $self->y;
     my $rot = $self->rot;
 
-    return '' if abs($x - $viewer->x) < -100 or abs($x - $viewer->x) > 1124 or abs($y - $viewer->y) < -100 or abs($y - $viewer->y) > 1124;
+    # return '' if abs($x - $viewer->x) < -50 or abs($x - $viewer->x) > 1070 or abs($y - $viewer->y) < -50 or abs($y - $viewer->y) > 1070;
 
     my $last_x;
     my $last_y;
