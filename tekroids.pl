@@ -32,6 +32,7 @@ o. 760 or 768?  get it right
 o. asteroid gravitational attraction and merging?  tried merging; very interesting indeed
 o. parallex stars?  starfield generator?  some kind of point of reference would make stuff less confusing
 o. http://www.youtube.com/watch?v=psaM7kK5Toc ... tune this thing up better so it looks like that
+o. score.  should get points for survival time and for hits.  would mean associating each missile with the player that show it.
 
 PERFORMANCE
 
@@ -124,6 +125,14 @@ async {
             # $timers{collision} += timeit(1, sub { test_collided( ) } ); # XXX
     
 #        };
+
+        #
+        # re-initialize board as needed
+        #
+
+        my %nums = ( asteroid => 0, missile => 0, ship => 0 );
+        for my $ob (@objects) { $nums{ref $ob}++ }
+        push @objects, map { asteroid->new } 1..15 if ! $nums{asteroid};
 
         #
         # move things
@@ -297,7 +306,7 @@ while(1) {
                     $fps_count = 0;    
                     $fps_second = time;
                 }
-                $message = 'x: ' . int($ship->x) . ' y: ' . int($ship->y) . " asteroids: $nums{asteroid} missiles: $nums{missile} ships: $nums{ship} players: $num_players fps: $fps_count_last";
+                $message = 'x: ' . int($ship->x) . ' y: ' . int($ship->y) . " asteroids: $nums{asteroid} missiles: $nums{missile} players: $nums{ship} fps: $fps_count_last";
     
             }
     
