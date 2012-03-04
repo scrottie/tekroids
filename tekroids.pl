@@ -18,13 +18,20 @@ sit there long enough, eventually it should come around again.  To re-join the g
 same set of asteroids will be floating around.  More aren't added once the game starts.  It's possible
 to clear the universe of asteroids.
 
+Some info on the Tekronics 4014 terminal and its emulation:  
+* http://invisible-island.net/xterm/xterm.faq.html
+* http://www.chilton-computing.org.uk/acd/icf/terminals/p005.htm 
+o. http://slowass.net/~scott/tmp/tek-4014-um.pdf
+
 TODO
 
+o. debris fields when the ship exploids or the smallest asteroid chunks finally get destroyed
 o. wrap around the edges of the world isn't graceful; you can't see past the edges, so asteroids etc suddenly appear
 o. maybe peoples ships should have varied shapes
 o. 760 or 768?  get it right
 o. asteroid gravitational attraction and merging?  tried merging; very interesting indeed
 o. parallex stars?  starfield generator?  some kind of point of reference would make stuff less confusing
+o. http://www.youtube.com/watch?v=psaM7kK5Toc ... tune this thing up better so it looks like that
 
 =cut
 
@@ -52,9 +59,11 @@ sub arg ($) { my $opt = shift; my $i=1; while($i<=$#ARGV) { return $ARGV[$i] if 
 my $world_x = 4096;
 my $world_y = 4096;
 
-my @asteroids = map { asteroid->new } 1..100;
+my @asteroids = map { asteroid->new } 1..40;
 my @missiles;
 my @ships;
+
+my $num_players = 0;
 
 my $port = 2003;
 
@@ -79,15 +88,21 @@ async {
         #
         # collision detection
         #
+
+        if( @ships ) {
+
+            # no one looking?  nothing happens
+
+            my @all = ( @ships, @missiles, @asteroids );
     
-        my @all = ( @ships, @missiles, @asteroids );
+            # for now, only interested in ship<->asteroid collisions and bullet<->asteroid collisions
     
-        # for now, only interested in ship<->asteroid collisions and bullet<->asteroid collisions
+            test_collided( @all );
     
-        test_collided( @all );
-    
-        # for my $o ( @ships ) { undef $o if $o->destroyed }      @ships = grep defined, @ships;
-        for my $o ( @asteroids ) { undef $o if $o->destroyed }  @asteroids = grep defined, @asteroids;
+            # for my $o ( @ships ) { undef $o if $o->destroyed }      @ships = grep defined, @ships;
+            for my $o ( @asteroids ) { undef $o if $o->destroyed }  @asteroids = grep defined, @asteroids;
+
+        };
 
         #
         # move things
@@ -151,6 +166,9 @@ while(1) {
 
         my $ship = ship->new;
         push @ships, $ship;
+
+        $num_players++;
+        print "got client connection: " . scalar(localtime) . " num players: $num_players\n";
 
       client_connected:
         while(1) {
@@ -252,7 +270,8 @@ while(1) {
     
                 $ship->add_thrust( $thrust );
  
-                $message = $ship->x . ' ' . $ship->y . ' ' . $ship->x_velocity . ' ' . $ship->y_velocity;
+                $message = 'x: ' . int($ship->x) . ' y: ' . int($ship->y) . ' asteroids: ' . scalar(@asteroids) . ' missiles: ' . scalar(@missiles) . ' ships: ' . scalar(@ships) . " players: $num_players ";
+                # $ship->x_velocity . ' ' . $ship->y_velocity;
     
             }
     
@@ -263,7 +282,7 @@ while(1) {
             $frame++;
     
             if( ! $ship->destroyed ) {
-                if( ! ( $frame % 7 ) ) {
+                if( ! ( $frame % 3 ) ) {   # XXX tune this
                     my $missile = missile->new;
                     $ship->copy_position_and_velocity_to( $missile );
                     $missile->animate for 1..2; # start in front of the ship
@@ -286,8 +305,12 @@ while(1) {
             Coro::Timer::sleep $sleep_for;
     
         }
+
+        @ships = grep $_ ne $ship, @ships;
+
+        $num_players--;
     
-        print "client went away: $!\n";
+        print "client went away: $!  num_players: $num_players\n";
 
     }; # end client handling async block
 
@@ -406,8 +429,10 @@ sub invincible :lvalue   { $_[0]->[10] }
 
 sub animate {
     my $self = shift;
-    $self->x += $self->x_velocity;   $self->x = $world_x if $self->x < 0; $self->x = 0 if $self->x > $world_x;
-    $self->y += $self->y_velocity;   $self->y = $world_y if $self->y < 0; $self->y = 0 if $self->y > $world_y;
+    # $self->x += $self->x_velocity;   $self->x = $world_x if $self->x < 0; $self->x = 0 if $self->x > $world_x;
+    # $self->y += $self->y_velocity;   $self->y = $world_y if $self->y < 0; $self->y = 0 if $self->y > $world_y;
+    $self->[2] += $self->[4];   $self->[2] = $world_x if $self->[2] < 0; $self->[2] = 0 if $self->[2] > $world_x;
+    $self->[3] += $self->[5];   $self->[3] = $world_y if $self->[3] < 0; $self->[3] = 0 if $self->[3] > $world_y;
 }
 
 sub draw {
@@ -515,7 +540,7 @@ sub new {
 sub animate {
     my $self = shift;
     $self->SUPER::animate;
-    $self->invincible-- if $self->invincible > 0;
+    # $self->invincible-- if $self->invincible > 0;
     $self->rot += $self->rot_velocity;
     $self->rot -= 360 if $self->rot >= 360;
 }
@@ -527,7 +552,7 @@ sub hit {
         return;
     }
     if( ref($them) eq 'ship' ) {
-        $them->destroyed = $self;
+        $them->destroyed = $self unless $them->destroyed;
     }
     if( ref($them) eq 'missile' ) {
         $self->break_up;
