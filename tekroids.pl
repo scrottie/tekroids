@@ -25,6 +25,10 @@ Some info on the Tekronics 4014 terminal and its emulation:
 
 TODO
 
+o. able to view objects on the other side of the wrap around -- special cases to the draw loop when on an any edge
+o. between waves, let people tweak game variables
+o. irc bot that will notify opt-ed in users when someone joins the game
+o. <hobbs> next unless ($x_a - $x_b) ** 2 + ($y_a - $y_b) ** 2 <= $size ** 2
 o. debris fields when the ship exploids or the smallest asteroid chunks finally get destroyed
 o. wrap around the edges of the world isn't graceful; you can't see past the edges, so asteroids etc suddenly appear
 o. maybe peoples ships should have varied shapes
@@ -33,6 +37,7 @@ o. asteroid gravitational attraction and merging?  tried merging; very interesti
 o. parallex stars?  starfield generator?  some kind of point of reference would make stuff less confusing
 o. http://www.youtube.com/watch?v=psaM7kK5Toc ... tune this thing up better so it looks like that
 o. score.  should get points for survival time and for hits.  would mean associating each missile with the player that show it.
+o. game challenges.  limited fuel; half way intelligent enemies; left to right side scroller with levelish stuff (objects pre-placed according to a level design); levels could include ships that blow up into essentially missiles to take other stuff with them; large bodies with gravity; space squid
 
 PERFORMANCE
 
@@ -81,10 +86,11 @@ sub arg ($) { my $opt = shift; my $i=1; while($i<=$#ARGV) { return $ARGV[$i] if 
 
 # my $world_x = 8192;
 # my $world_y = 8192;
-my $world_x = 2500;
-my $world_y = 2500;
+my $world_x = 2000;
+my $world_y = 2000;
 
 my @objects = map { asteroid->new } 1..15;
+push @objects, map { star->new } 1..20; # XXX
 
 my $num_players = 0;
 
@@ -228,8 +234,9 @@ while(1) {
 
                 my $buf = '';
                 my $i = 0;
-                $i++ while $i < $#objects and $objects[$i]->[2] + 570 < $ship->[2];
-                while( $i < $#objects and $objects[$i]->[2] < $ship->[2] + 570 ) {
+                # skip stuff off the left of the screen; 600 = about half of 1024, the screen X size, plus half of 100, the max diameter of an object
+                $i++ while $i < $#objects and $objects[$i]->[2] + 600 < $ship->[2];
+                while( $i < $#objects and $objects[$i]->[2] < $ship->[2] + 600 ) {
                     $buf .= $objects[$i]->draw( $ship ) if $objects[$i]->[3] + 500 > $ship->[3] and $objects[$i]->[3] < $ship->[3] + 500;
                     $i++;
                 }
@@ -252,8 +259,8 @@ while(1) {
             #
     
             $client->print(
-                chr(27), chr(26),              # GIN... "escape-ENQ recieved from the computer while the crosshairs are being displayed..."... "escape SUB"
-                chr(27), chr(5),               # escape-ENQ
+                chr(27), chr(26),              # Tek GIN mode (Graphics IN)
+                chr(27), chr(5),               # escape-ENQ -- request mouse position from terminal
             );
     
             my $line = '';
@@ -287,15 +294,21 @@ while(1) {
     
                 my $distance = sqrt( $x_delta ** 2 + $y_delta ** 2 );
                 my $thrust = 0;
-                $thrust = 0.1 if $distance > 100;  # XXX tune this
                 $thrust = 0.2 if $distance > 200;  # XXX tune this
-                $thrust = 0.3 if $distance > 400;  # XXX tune this
+                $thrust = 0.4 if $distance > 300;  # XXX tune this
+                $thrust = 0.8 if $distance > 400;  # XXX tune this
 
-                $thrust /= 2 if $thrust > 0 and abs($ship->x_velocity) > 1.5 or abs($ship->y_velocity) > 1.5;  # XXX tune this
-                $thrust /= 2 if $thrust > 0 and abs($ship->x_velocity) > 3 or abs($ship->y_velocity) > 3;
-                $thrust = 0 if $thrust > 0 and abs($ship->x_velocity) > 7 or abs($ship->y_velocity) > 7;
+                # $thrust /= 2 if $thrust > 0 and abs($ship->x_velocity) > 1.5 or abs($ship->y_velocity) > 1.5;  # XXX tune this
+                # $thrust = 0 if $thrust > 0 and abs($ship->x_velocity) > 3 or abs($ship->y_velocity) > 3; # no, that'll keep them from accelerating in a different direction, which includes ever slowing down.  oops.
     
                 $ship->add_thrust( $thrust );
+                my $speed = sqrt( $ship->x_velocity ** 2 + $ship->y_velocity ** 2 );
+                if( $speed > 3 ) {
+                    $speed = 3;
+                    my $angle = atan2( $ship->x_velocity, $ship->y_velocity ) * 57.2;  # +/- pi to degrees
+                    $ship->x_velocity = cos(Math::Trig::deg2rad($angle)) * $speed;
+                    $ship->y_velocity = sin(Math::Trig::deg2rad($angle)) * $speed;
+                }
  
                 my %nums = ( asteroid => 0, missile => 0, ship => 0 );
                 for my $ob (@objects) { $nums{ref $ob}++ }
@@ -305,8 +318,10 @@ while(1) {
                     $fps_count_last = $fps_count;
                     $fps_count = 0;    
                     $fps_second = time;
+                    # if( $fps_count_last == 0 { DB::finish_profile(); exit; }
                 }
-                $message = 'x: ' . int($ship->x) . ' y: ' . int($ship->y) . " asteroids: $nums{asteroid} missiles: $nums{missile} players: $nums{ship} fps: $fps_count_last";
+                my $airspeed = sprintf "%2.1f", $speed; # sqrt( $ship->x_velocity ** 2 + $ship->y_velocity ** 2 );
+                $message = 'x: ' . int($ship->x) . ' y: ' . int($ship->y) . " speed: $airspeed asteroids: $nums{asteroid} players: $nums{ship} fps: $fps_count_last";
     
             }
     
@@ -742,6 +757,48 @@ sub draw {
 }
 
 sub hit { }
+
+#
+#
+#
+
+package star;
+
+use base 'adrift';
+
+sub new {
+    my $package = shift;
+    my $self = bless [ ], $package;
+    $self->x = int rand $world_x;
+    $self->y = int rand $world_y;
+    $self->size = 1;
+    return $self;
+}
+
+sub hit { }
+
+sub animate { }
+
+sub draw {
+    my $self = shift;
+    my $viewer = shift;
+
+    my $x =    $self->x - $viewer->x + 1024/2;
+    my $y =    $self->y - $viewer->y + 760/2;
+    my $radius = 3;
+
+    my $buf = '';
+
+    for my $arc ( 0, 45, 90 ) {
+        my $x1 = $x + cos(Math::Trig::deg2rad($arc)) * $radius;
+        my $y1 = $y + sin(Math::Trig::deg2rad($arc)) * $radius;
+        my $x2 = $x + cos(180 + Math::Trig::deg2rad($arc)) * $radius;
+        my $y2 = $y + sin(180 + Math::Trig::deg2rad($arc)) * $radius;
+        $buf .= main::draw_line( $x1, $y1, $x2, $y2 );
+    }
+
+    return $buf;
+}
 
 __DATA__
 
