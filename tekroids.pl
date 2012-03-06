@@ -80,6 +80,10 @@ use IO::Socket;
 # use Time::HiRes 'gettimeofday';
 use Math::Trig 'deg2rad';
 use Fcntl;
+use Carp;
+
+$SIG{__DIE__} = sub { Carp::cluck @_; die @_ };
+# $SIG{__WARN__} = sub { Carp::cluck @_ };
 
 sub opt ($) { scalar grep $_ eq $_[0], @ARGV }
 sub arg ($) { my $opt = shift; my $i=1; while($i<=$#ARGV) { return $ARGV[$i] if $ARGV[$i-1] eq $opt; $i++; } }
@@ -90,7 +94,7 @@ my $world_x = 2000;
 my $world_y = 2000;
 
 my @objects = map { asteroid->new } 1..15;
-push @objects, map { star->new } 1..20; # XXX
+# push @objects, map { star->new } 1..20; # XXX give points of reference for testing
 
 my $num_players = 0;
 
@@ -225,22 +229,16 @@ while(1) {
 
                 # draw missiles and other ships, but not our own ship, and only the asteroid that killed us
 
-                $client->print( fun_stuff($message) );
+                my $buf = '';
                 for my $ob ( @objects ) {
-                    $client->print( $ob->draw( $ship ) ) if $destroyed == $ob or ref $ob eq 'missile' or (ref $ob eq 'ship' and $ob ne $ship);
+                    $buf .= $ob->draw( $ship ) if $destroyed == $ob or ref $ob eq 'missile' or (ref $ob eq 'ship' and $ob ne $ship);
                 }
+                $client->print( redraw_screen($message), $buf );
 
             } else {
 
-                my $buf = '';
-                my $i = 0;
-                # skip stuff off the left of the screen; 600 = about half of 1024, the screen X size, plus half of 100, the max diameter of an object
-                $i++ while $i < $#objects and $objects[$i]->[2] + 600 < $ship->[2];
-                while( $i < $#objects and $objects[$i]->[2] < $ship->[2] + 600 ) {
-                    $buf .= $objects[$i]->draw( $ship ) if $objects[$i]->[3] + 500 > $ship->[3] and $objects[$i]->[3] < $ship->[3] + 500;
-                    $i++;
-                }
-                $client->print(fun_stuff($message), $buf);  # wait on printing the clear screen until we have data to send to minimize flicker
+                my $buf = draw_stuff($ship);
+                $client->print( redraw_screen($message), $buf );  # wait on printing the clear screen until we have data to send to minimize flicker
 
                 # for my $ob ( @objects ) {
                 #     $client->print( $ob->draw( $ship ) );
@@ -368,8 +366,10 @@ sub test_collided {
 
     @objects = sort { $a->x <=> $b->x } @objects;
 
-    my $left_i = 0;
+    my $left_i = -1;
     my $right_i = 0;
+
+    $left_i-- while $left_i > - $#objects and $objects[$left_i]->x < $world_x - 100; # start viewing both edges of the universe
 
     # do an n:n comparison, comparing each object to each other one, inside of a sliding window of objects
     # whose x positions are within a hard-coded range of each other
@@ -391,10 +391,12 @@ sub test_collided {
 
         my $x_a = $left->[2]; # $left->x; ... speed
         my $x_b = $right->[2]; # $right->x; ... speed
+        $x_b -= $world_x if $x_a > $world_x - 100 and $x_b < 100;  # $x_a is on the right edge and $x_a the left
+        $x_a -= $world_x if $x_b > $world_x - 100 and $x_a < 100;  # $x_a is on the left edge and $x_a the right
 
-        if( abs( $x_a - $x_b ) > 200 ) {
-            # nothing is currently larger than 100 XXX
-            # the left object and right (which may not be right next to each other in the array) are too far apart;
+        if( abs( $x_a - $x_b ) > 100 ) {
+            # nothing is currently larger than diameter 100 / radius 50 XXX
+            # the left object and right (which may not be right next to each other in the X buffer) are too far apart;
             # rather than advancing which object is the right object, keep that one, but advance the left one
             $left_i++;
             $right_i = $left_i;
@@ -413,13 +415,15 @@ sub test_collided {
 
         my $y_a = $left->[3]; # $left->y; ... speed
         my $y_b = $right->[3]; # $right->y; ... speed
-        next unless abs( $y_a - $y_b ) < 200;  # nothing is currently larger than 100 XXX
+        $y_b -= $world_y if $y_a > $world_y - 100 and $y_b < 100;  # $y_a is on the bottom edge and $y_a the top
+        $y_a -= $world_y if $y_b > $world_y - 100 and $y_a < 100;  # $y_a is on the top edge and $y_a the bottom
+        next unless abs( $y_a - $y_b ) < 100;  # nothing is currently larger than diameter 100 / radius 50 XXX
 
         # oh, they're close!
         my $size = $left->size + $right->size;
-        next unless sqrt( abs( $x_a - $x_b ) ** 2 + abs( $y_a - $y_b ) ** 2 ) <= $size;
+        next unless abs( $x_a - $x_b ) ** 2 + abs( $y_a - $y_b ) ** 2 <= $size ** 2;
 
-        # die "combined size: $size hypot: " . sqrt( abs( $x_a - $x_b ) ** 2 + abs( $y_a - $y_b ) ** 2 ) . '; a ' . ref( $left ) . ' hit a ' . ref( $right ); 
+        # warn "combined size: $size hypot: " . sqrt( abs( $x_a - $x_b ) ** 2 + abs( $y_a - $y_b ) ** 2 ) . '; a ' . ref( $left ) . ' hit a ' . ref( $right ); 
 
         # awww, shit
         $left->hit( $right );
@@ -429,6 +433,65 @@ sub test_collided {
 
 }
 
+sub draw_stuff {
+    my $ship = shift;
+local $SIG{__DIE__} = sub { Carp::cluck @_; die @_ };
+
+    my $buf = '';
+
+    my $draw_stuff_inner = sub {
+        my $ship = shift;
+        my $i = 0;
+        # skip stuff off the left of the screen; 600 = about half of 1024, the screen X size, plus half of 100, the max diameter of an object
+
+        $i++ while $i < $#objects and $objects[$i]->[2] + 600 < $ship->[2];
+        while( $i < $#objects and $objects[$i]->[2] < $ship->[2] + 600 ) {
+            $buf .= $objects[$i]->draw( $ship ) if $objects[$i]->[3] + 500 > $ship->[3] and $objects[$i]->[3] < $ship->[3] + 500;
+            $i++;
+        }
+    };
+
+    # my $draw_stuff_inner = sub {
+    #     # naive algorithm; works, but may be slower
+    #     my $ship = shift;
+    #         for my $ob ( @objects ) {
+    #             $buf .= $ob->draw( $ship );
+    #         }
+    # };
+
+    $buf .= chr(27).chr(96); # normal line XXX
+    $draw_stuff_inner->( $ship );
+
+    if( $ship->x < 1024 / 2 or $ship->x > $world_x - 1024 / 2 or $ship->y < 768 / 2 or $ship->y > $world_y - 768 / 2 ) {
+
+        # peer around the edge of the world to see what we'll see after we wrap around
+
+        my $x_margin = 1024 / 2 + 50;
+        my $y_margin = 768 / 2 + 50;
+
+        my $dummy_ship = ship->new;
+        if( $ship->x < $x_margin ) {
+            $dummy_ship->x = $ship->x + $world_x;
+        } elsif( $ship->x > $world_x - $x_margin ) {
+            $dummy_ship->x = $ship->x - $world_x;
+        } else {
+            $dummy_ship->x = $ship->x;
+        }
+        if( $ship->y < $y_margin ) {
+            $dummy_ship->y = $ship->y + $world_y;
+        } elsif( $ship->y > $world_y - $y_margin ) {
+            $dummy_ship->y = $ship->y - $world_y;
+        } else {
+            $dummy_ship->y = $ship->y;
+        }
+        $buf .= chr(27).chr(97); # dashed line XXX
+        $draw_stuff_inner->( $dummy_ship );
+        $buf .= chr(27).chr(96); # normal line XXX
+
+    }
+
+    return $buf;
+}
 
 sub draw_line {
     my $x1 = int shift;  my $y1 = int shift;
@@ -456,7 +519,7 @@ sub text_mode {
     );
 }
 
-sub fun_stuff {
+sub redraw_screen {
     my $message = shift;
     return join( '',
         chr(27), chr(12),   # clear screen 
@@ -505,8 +568,6 @@ sub draw {
     my $x = $self->x;
     my $y = $self->y;
 
-    # return '' if abs($x - $viewer->x) < -50 or abs($x - $viewer->x) > 1070 or abs($y - $viewer->y) < -50 or abs($y - $viewer->y) > 1070;
-
     my @shape = @$shape;  # copy
     my $arc = $self->rot;
     my $last_x;
@@ -518,8 +579,6 @@ sub draw {
         my $radius = shift @shape;
         my $pointX = $x + cos(Math::Trig::deg2rad($arc)) * $radius;
         my $pointY = $y + sin(Math::Trig::deg2rad($arc)) * $radius;
-        # $pointX = $viewer->x - $pointX + 1024/2;
-        # $pointY = $viewer->y - $pointY + 760/2;
         $pointX = $pointX - $viewer->x + 1024/2;
         $pointY = $pointY - $viewer->y + 760/2;
         if( $last_x and $last_y ) {
@@ -616,7 +675,7 @@ sub hit {
         return;
     }
     if( ref($them) eq 'ship' ) {
-        $them->destroyed = $self unless $them->destroyed;
+        $them->destroyed = $self unless $them->destroyed; # XXX
     }
     if( ref($them) eq 'missile' ) {
         $self->break_up;
@@ -741,12 +800,10 @@ sub draw {
     my $y = $self->y;
     my $rot = $self->rot;
 
-    # return '' if abs($x - $viewer->x) < -50 or abs($x - $viewer->x) > 1070 or abs($y - $viewer->y) < -50 or abs($y - $viewer->y) > 1070;
-
     my $last_x;
     my $last_y;
 
-    my $x1 =    $x - $viewer->x + 1024/2;
+    my $x1 =    $x - $viewer->x + 1024/2;   # object - viewer is correct
     my $y1 =    $y - $viewer->y + 760/2;
 
     return main::draw_line(
