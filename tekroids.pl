@@ -28,11 +28,8 @@ TODO
 o. able to view objects on the other side of the wrap around -- special cases to the draw loop when on an any edge
 o. between waves, let people tweak game variables
 o. irc bot that will notify opt-ed in users when someone joins the game
-o. <hobbs> next unless ($x_a - $x_b) ** 2 + ($y_a - $y_b) ** 2 <= $size ** 2
 o. debris fields when the ship exploids or the smallest asteroid chunks finally get destroyed
-o. wrap around the edges of the world isn't graceful; you can't see past the edges, so asteroids etc suddenly appear
 o. maybe peoples ships should have varied shapes
-o. 760 or 768?  get it right
 o. asteroid gravitational attraction and merging?  tried merging; very interesting indeed
 o. parallex stars?  starfield generator?  some kind of point of reference would make stuff less confusing
 o. http://www.youtube.com/watch?v=psaM7kK5Toc ... tune this thing up better so it looks like that
@@ -53,13 +50,15 @@ animate   => 430356592784
 I figured collision detection would be taking the vast majority of the CPU, but it doesn't take any more than
 just advacing objects on their trajectories, which is fair micro-optimized.
 
-NYTProf coredumps, probably because of Coro.
+Update:  NYTProf runs under Coro when given the (environment variable) argument NYTPROF='subs=0'.
 
 Objects are kept sorted by X.  quicksort runs very near O(n) time when the data is almost entirely already sorted,
 so keeping it sorted as items are added is pretty inexpensive.
 
 Most of the inlining things and breaking encapsulation and other muckiness seems to be for naught and should 
 probably be ripped back out.
+
+Update:  collision detection got translated to C!  Yay!
 
 =cut
 
@@ -88,12 +87,10 @@ $SIG{__DIE__} = sub { Carp::cluck @_; die @_ };
 sub opt ($) { scalar grep $_ eq $_[0], @ARGV }
 sub arg ($) { my $opt = shift; my $i=1; while($i<=$#ARGV) { return $ARGV[$i] if $ARGV[$i-1] eq $opt; $i++; } }
 
-# my $world_x = 8192;
-# my $world_y = 8192;
-my $world_x = 2000;
-my $world_y = 2000;
+our $world_x = 2000;
+our $world_y = 2000;
 
-my @objects = map { asteroid->new } 1..15;
+our @objects = map { asteroid->new } 1..15;
 # push @objects, map { star->new } 1..20; # XXX give points of reference for testing
 
 my $num_players = 0;
@@ -131,7 +128,11 @@ async {
 
             # for now, only interested in ship<->asteroid collisions and bullet<->asteroid collisions
     
-            test_collided( );
+            # test_collided( ); # XXXXX pure perl version; works
+
+            @objects = sort { $a->x <=> $b->x } @objects;
+            test_collided2();  # XS version; needs us to do the sort for it here; use this one or the pure perl version
+
             # $timers{collision} += timeit(1, sub { test_collided( ) } ); # XXX
     
 #        };
@@ -286,7 +287,7 @@ while(1) {
             if( ! $ship->destroyed ) {
     
                 my $x_delta = $mouse_x - 1024/2;
-                my $y_delta = $mouse_y - 760/2;
+                my $y_delta = $mouse_y - 768/2;
     
                 $ship->rot = atan2( $y_delta, $x_delta ) * 57.2;  # +/- pi to degrees
     
@@ -369,7 +370,7 @@ sub test_collided {
     my $left_i = -1;
     my $right_i = 0;
 
-    $left_i-- while $left_i > - $#objects and $objects[$left_i]->x < $world_x - 100; # start viewing both edges of the universe
+    $left_i-- while $left_i > - $#objects and $objects[$left_i]->x > $world_x - 100; # start viewing both edges of the universe
 
     # do an n:n comparison, comparing each object to each other one, inside of a sliding window of objects
     # whose x positions are within a hard-coded range of each other
@@ -433,9 +434,120 @@ sub test_collided {
 
 }
 
+use Inline C => Config => CCFLAGS => '-std=c99';
+use Inline C => <<'END_OF_C';
+
+#include <math.h>
+
+#define get_x(o) (SvIV(*av_fetch((AV*)o, 2, 0)))
+#define get_y(o) (SvIV(*av_fetch((AV*)o, 3, 0)))
+#define get_size(o) (SvIV(*av_fetch((AV*)o, 8, 0)))
+
+#define get_ob(o,i) (SvRV( *av_fetch((AV*)o, i, 0)))
+
+void test_collided2() {
+
+    dSP;
+
+    AV* objects = get_av("main::objects", 0);
+    int num_objects = av_len( objects );
+
+    int world_x = SvIV( get_sv("main::world_x", 0) );
+    int world_y = SvIV( get_sv("main::world_x", 0) );
+
+    int left_i = -1;
+    int right_i = 0;
+
+    // start viewing both edges of the universe
+
+    while( left_i > - num_objects && get_x(get_ob(objects, left_i)) > world_x - 100 ) {
+        left_i--;
+    }
+
+    // do an n:n comparison, comparing each object to each other one, inside of a sliding window of objects
+    // whose x positions are within a hard-coded range of each other
+
+    while(1) {
+
+        right_i++;
+
+      advanced_left_position:
+
+        if( left_i == right_i ) continue;
+
+        if( right_i > num_objects ) break;
+
+        AV* left = get_ob(objects, left_i );
+        AV* right = get_ob(objects, right_i );
+
+        // print "test_collided: left_i: left_i right_i: right_i left x: @{[ left->x ]} right x: @{[ right->x ]}\n";
+
+        int x_a = get_x(left);
+        int x_b = get_x(right);
+        if( x_a > world_x - 100 && x_b < 100 ) x_b -= world_x;  // x_a is on the right edge and x_a the left
+        if( x_b > world_x - 100 && x_a < 100 ) x_a -= world_x;  // x_a is on the left edge and x_a the right
+
+        if( abs( x_a - x_b ) > 100 ) {
+            // nothing is currently larger than diameter 100 / radius 50 XXX
+            // the left object and right (which may not be right next to each other in the X buffer) are too far apart;
+            // rather than advancing which object is the right object, keep that one, but advance the left one
+            left_i++;
+            right_i = left_i;
+            goto advanced_left_position;
+        }
+
+        // not interested in missile-missile collisions, and missiles are often near lots of other missiles
+        if( sv_isa((SV*)left, "missile") && sv_isa((SV*)right, "missile" ) ) continue;
+
+        // co-op!
+        // XXX since ships don't hit missiles very often, it would probably be faster to not do this and then ignore the collision when it happens
+        if( sv_isa((SV*)left, "missile") && sv_isa((SV*)right, "ship") ) continue;
+        if( sv_isa((SV*)left, "ship") && sv_isa((SV*)right, "missile") ) continue;
+
+        // okay, ignoring asteroid-asteroid interactions for now, as much fun as that is
+        if( sv_isa((SV*)left, "asteroid") && sv_isa((SV*)right, "asteroid") ) continue; // XXX comment this out to enable asteroid interactions
+
+        int y_a = get_y(left);
+        int y_b = get_y(right);
+        if( y_a > world_y - 100 && y_b < 100 ) y_b -= world_y; // y_a is on the bottom edge and y_a the top
+        if( y_b > world_y - 100 && y_a < 100 ) y_a -= world_y; // y_a is on the top edge and y_a the bottom
+        if( ! ( abs( y_a - y_b ) < 100 ) ) continue;  // nothing is currently larger than diameter 100 / radius 50 XXX
+
+        // oh, they're close!
+        int size = get_size(left) + get_size(right);
+        if( ! ( pow(abs( x_a - x_b ), 2) + pow(abs( y_a - y_b ), 2) <= pow(size, 2) ) ) continue;
+
+        // warn "combined size: size hypot: " . sqrt( abs( x_a - x_b ) ** 2 + abs( y_a - y_b ) ** 2 ) . '; a ' . ref( left ) . ' hit a ' . ref( right ); 
+
+        // awww, shit
+
+        // printf("collision between objects at %d,%d and %d,%d\n", get_x(left), get_y(left), get_x(right), get_y(right));
+
+        // left->hit( right );
+        PUSHMARK(sp);
+        XPUSHs( *av_fetch((AV*)objects, left_i, 0));
+        XPUSHs( *av_fetch((AV*)objects, right_i, 0));
+        PUTBACK;
+        call_method("hit", G_DISCARD);
+
+        // right->hit( left );
+        PUSHMARK(sp);
+        XPUSHs( *av_fetch((AV*)objects, right_i, 0));
+        XPUSHs( *av_fetch((AV*)objects, left_i, 0));
+        PUTBACK;
+        call_method("hit", G_DISCARD);
+
+    }
+
+}
+
+END_OF_C
+
+
 sub draw_stuff {
     my $ship = shift;
-local $SIG{__DIE__} = sub { Carp::cluck @_; die @_ };
+
+    local $SIG{__DIE__} = sub { Carp::cluck @_; die @_ };
 
     my $buf = '';
 
@@ -495,9 +607,9 @@ local $SIG{__DIE__} = sub { Carp::cluck @_; die @_ };
 
 sub draw_line {
     my $x1 = int shift;  my $y1 = int shift;
-    return '' if $x1 < 0 or $x1 > 1023 or $y1 < 0 or $y1 >= 760; # XXX what is the bottom of the screen?
+    return '' if $x1 < 0 or $x1 > 1023 or $y1 < 0 or $y1 >= 768; # XXX what is the bottom of the screen?
     my $x2 = int shift;  my $y2 = int shift;
-    return '' if $x2 < 0 or $x2 > 1023 or $y2 < 0 or $y2 >= 760;
+    return '' if $x2 < 0 or $x2 > 1023 or $y2 < 0 or $y2 >= 768;
     my $tek_buffer = '';
     $tek_buffer .= chr(29);
     $tek_buffer .= draw_point($x1, $y1);
@@ -580,7 +692,7 @@ sub draw {
         my $pointX = $x + cos(Math::Trig::deg2rad($arc)) * $radius;
         my $pointY = $y + sin(Math::Trig::deg2rad($arc)) * $radius;
         $pointX = $pointX - $viewer->x + 1024/2;
-        $pointY = $pointY - $viewer->y + 760/2;
+        $pointY = $pointY - $viewer->y + 768/2;
         if( $last_x and $last_y ) {
             $out .= main::draw_line( $last_x, $last_y, $pointX, $pointY );
         }
@@ -746,7 +858,7 @@ sub new {
         140, 10, # back around to the nose
     ];
     # $self->x = 1024/2;
-    # $self->y = 760/2;
+    # $self->y = 768/2;
     $self->x = int rand $world_x;
     $self->y = int rand $world_y;
     $self->x_velocity = 0;
@@ -804,7 +916,7 @@ sub draw {
     my $last_y;
 
     my $x1 =    $x - $viewer->x + 1024/2;   # object - viewer is correct
-    my $y1 =    $y - $viewer->y + 760/2;
+    my $y1 =    $y - $viewer->y + 768/2;
 
     return main::draw_line(
         $x1, $y1, 
@@ -841,7 +953,7 @@ sub draw {
     my $viewer = shift;
 
     my $x =    $self->x - $viewer->x + 1024/2;
-    my $y =    $self->y - $viewer->y + 760/2;
+    my $y =    $self->y - $viewer->y + 768/2;
     my $radius = 3;
 
     my $buf = '';
@@ -892,4 +1004,22 @@ in asteroid::break_up:
     #    push @asteroids, $asteroid;
     #}
     # $self->destroyed = 1;
+
+/*
+    for(int i = 0; i < num_objects; i++ ) {
+        AV* ob;
+        ob = get_ob(objects, i);
+        printf("%d - x: %d \n", i, get_x(ob) );
+    }
+ */
+
+/*
+    for(int i = 0; i < objects_len; i++ ) {
+        AV* ob;
+        ob = SvRV( *av_fetch( objects, i, 0 ) );
+        // printf("%d - x: %d y: %d\n", i, SvIV( (SV*) av_fetch(ob, 2, 0) ), SvIV( (SV*) av_fetch(ob, 3, 0) ) );
+        printf("%d - x: %d \n", i, SvIV( *av_fetch(ob, 2, 0) ) );
+    }
+ */
+
 
